@@ -1,1 +1,8 @@
 .env
+*.exe
+*.dll
+*.sys
+server
+*.o
+*.a
+*.so
