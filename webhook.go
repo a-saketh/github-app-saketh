@@ -4,7 +4,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -12,34 +11,41 @@ import (
 	"strings"
 )
 
-// verifyWebhookSignature validates the GitHub webhook signature
+// verifyWebhookSignature validates the HMAC-SHA256 signature attached to a
+// webhook payload. Works for both GitHub (X-Hub-Signature-256) and Bitbucket
+// (X-Hub-Signature) because both use the same algorithm.
 func verifyWebhookSignature(payload []byte, signature string, secret string) bool {
-	// GitHub uses X-Hub-Signature-256: sha256=<signature>
-	// Remove "sha256=" prefix if present
+	// Strip the "sha256=" prefix that GitHub and Bitbucket both include.
 	if strings.HasPrefix(signature, "sha256=") {
 		signature = signature[7:]
 	}
-
-	// Create HMAC SHA256 hash
 	h := hmac.New(sha256.New, []byte(secret))
 	h.Write(payload)
-	expectedSignature := hex.EncodeToString(h.Sum(nil))
-
-	// Compare signatures (constant time comparison for security)
-	return hmac.Equal([]byte(expectedSignature), []byte(signature))
+	expected := hex.EncodeToString(h.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(signature))
 }
 
-// WebhookHandler processes incoming GitHub webhooks
+// WebhookHandler is the single HTTP endpoint that receives webhooks from any
+// supported SCM platform (GitHub, Bitbucket).
+//
+// Processing flow (mirrors the sequence diagram):
+//  1. Read and verify the HMAC signature  → reject invalid payloads early.
+//  2. Detect which SCM platform sent the event.
+//  3. Return 200 OK immediately  (non-blocking acknowledgement to the SCM).
+//  4. Publish the raw event to RabbitMQ (raw_webhook_events queue).
+//     The SCM Adapter consumer picks it up asynchronously, normalizes it,
+//     and forwards it to the Unified Event Bus (normalized_pr_events queue).
 func WebhookHandler(w http.ResponseWriter, r *http.Request) {
-	log.Println("webhook received!!")
+	log.Println("=== Webhook received ===")
 
+	// --- Step 1: Read body ---
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "cannot read body", http.StatusInternalServerError)
 		return
 	}
 
-	// Verify webhook signature
+	// --- Step 2: Verify signature ---
 	webhookSecret := os.Getenv("WEBHOOK_SECRET")
 	if webhookSecret == "" {
 		log.Println("Error: WEBHOOK_SECRET environment variable not set")
@@ -47,78 +53,59 @@ func WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GitHub uses X-Hub-Signature-256; Bitbucket uses X-Hub-Signature.
 	signature := r.Header.Get("X-Hub-Signature-256")
 	if signature == "" {
-		log.Println("Error: X-Hub-Signature-256 header missing")
+		signature = r.Header.Get("X-Hub-Signature")
+	}
+	if signature == "" {
+		log.Println("Error: webhook signature header missing")
 		http.Error(w, "signature missing", http.StatusBadRequest)
 		return
 	}
-
 	if !verifyWebhookSignature(body, signature, webhookSecret) {
-		log.Println("Error: Invalid webhook signature - verification failed")
+		log.Println("Error: webhook signature verification failed")
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
+	log.Println("Signature verified successfully")
 
-	log.Println("Webhook signature verified successfully!")
+	// --- Step 3: Detect platform ---
+	platform := DetectPlatform(r.Header)
+	log.Printf("Detected SCM platform: %s\n", platform)
 
-	// Print event type
-	eventType := r.Header.Get("X-GitHub-Event")
-	log.Println("Event type:", eventType)
+	// Resolve the raw event-type string from the appropriate header.
+	eventType := r.Header.Get("X-GitHub-Event") // GitHub
+	if platform == PlatformBitbucket {
+		eventType = r.Header.Get("X-Event-Key") // Bitbucket
+	}
+	log.Printf("Event type: %s\n", eventType)
 
-	// Parse webhook payload
-	var payload WebhookPayload
-	err = json.Unmarshal(body, &payload)
-	if err != nil {
-		log.Println("Error: Failed to parse webhook payload:", err)
-		http.Error(w, "invalid payload format", http.StatusBadRequest)
+	// --- Step 4: Acknowledge immediately ---
+	// The SCM expects a fast 200 OK. All further processing happens after the
+	// response is sent, keeping the webhook round-trip non-blocking.
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("received"))
+
+	// --- Step 5: Skip non-PR events ---
+	isPREvent := eventType == "pull_request" || strings.HasPrefix(eventType, "pullrequest:")
+	if !isPREvent {
+		log.Printf("Skipping non-PR event: %s\n", eventType)
 		return
 	}
 
-	// Extract PR details
-	prTitle := payload.PullRequest.Title
-	prNumber := payload.PullRequest.Number
-	prCreator := payload.PullRequest.User.Login
-	repoOwner := payload.Repository.Owner.Login
-	repoName := payload.Repository.Name
-
-	// Log extracted information
-	log.Println("=== Extracted PR Details ===")
-	log.Println("PR Title:", prTitle)
-	log.Println("PR Number:", prNumber)
-	log.Println("PR Creator:", prCreator)
-	log.Println("Repository Owner:", repoOwner)
-	log.Println("Repository Name:", repoName)
-
-	// Fetch changed files for PR events
-	if eventType == "pull_request" && prNumber != 0 {
-		log.Println("Fetching changed files for PR...")
-
-		appID := getAppIDFromEnv()
-		privateKey := getPrivateKeyFromEnv()
-
-		if appID != "" && privateKey != "" {
-			jwtToken, err := generateJWT(appID, privateKey)
-			if err == nil {
-				installationToken, err := getInstallationToken(jwtToken, repoOwner, repoName)
-				if err == nil {
-					files, err := getPRChangedFiles(installationToken, repoOwner, repoName, prNumber)
-					if err == nil {
-						logPRChangedFiles(files)
-					} else {
-						log.Println("Warning: Could not fetch PR files:", err)
-					}
-				} else {
-					log.Println("Warning: Could not get installation token:", err)
-				}
-			} else {
-				log.Println("Warning: Could not generate JWT:", err)
-			}
-		} else {
-			log.Println("Warning: GitHub App credentials not configured")
-		}
+	// --- Step 6: Publish raw event to the message queue ---
+	if mq == nil {
+		log.Println("Warning: RabbitMQ not initialised, raw event dropped")
+		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("received"))
+	msg := RawWebhookMessage{
+		Platform:  platform,
+		EventType: eventType,
+		Payload:   body,
+	}
+	if err := mq.PublishRawEvent(msg); err != nil {
+		log.Printf("Warning: could not publish raw event to queue: %v\n", err)
+	}
 }

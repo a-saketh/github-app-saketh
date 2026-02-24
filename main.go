@@ -3,9 +3,14 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/joho/godotenv"
 )
+
+// mq is the package-level RabbitMQ client shared by the webhook handler and
+// the consumer. It is initialised in main before the HTTP server starts.
+var mq *RabbitMQ
 
 func main() {
 	// Load environment variables from .env file
@@ -21,6 +26,22 @@ func main() {
 		log.Println("✓ GITHUB_APP_ID is set:", appID)
 	} else {
 		log.Println("⚠ Warning: GITHUB_APP_ID is not set")
+	}
+
+	// Connect to RabbitMQ and start the async consumer.
+	rabbitmqURL := os.Getenv("RABBITMQ_URL")
+	if rabbitmqURL == "" {
+		rabbitmqURL = "amqp://guest:guest@localhost:5672/"
+	}
+	var err error
+	mq, err = NewRabbitMQ(rabbitmqURL)
+	if err != nil {
+		log.Printf("Warning: could not connect to RabbitMQ (%s): %v — webhook events will be dropped\n", rabbitmqURL, err)
+	} else {
+		log.Println("Connected to RabbitMQ:", rabbitmqURL)
+		go StartConsumer(mq)
+		go StartEventBusConsumer(mq)
+		defer mq.Close()
 	}
 
 	// Register HTTP routes
